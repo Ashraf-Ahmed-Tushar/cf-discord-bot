@@ -6,6 +6,23 @@ import os
 from datetime import datetime, timezone
 import pytz
 
+from flask import Flask
+from threading import Thread
+
+app = Flask('')
+
+@app.route('/')
+def home():
+    return "Bot is alive"
+
+def run():
+    app.run(host='0.0.0.0', port=8080)
+
+def keep_alive():
+    t = Thread(target=run)
+    t.start()
+
+
 TOKEN = os.getenv("TOKEN")
 CHANNEL_ID = int(os.getenv("CHANNEL_ID"))
 REMINDER_CHANNEL_ID = int(os.getenv("REMINDER_CHANNEL_ID"))
@@ -79,6 +96,7 @@ async def check_contests():
                 already_reminder_sent = any(
                     f"https://codeforces.com/contest/{contest['id']}" in msg.content for msg in messages_rem
                 )
+
                 if not already_reminder_sent and 28000 < diff < 29000:
                     time_text = start_time_bd.strftime("%d-%m-%Y  < %I:%M %p >")
                     embed = discord.Embed(
@@ -109,5 +127,7 @@ async def check_contests():
 async def on_ready():
     print(f"Logged in as {client.user}")
     client.loop.create_task(check_contests())
+
+keep_alive()
 
 client.run(TOKEN)
