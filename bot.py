@@ -8,6 +8,7 @@ import pytz
 
 TOKEN = os.getenv("TOKEN")
 CHANNEL_ID = int(os.getenv("CHANNEL_ID"))
+REMINDER_CHANNEL_ID = int(os.getenv("REMINDER_CHANNEL_ID"))
 
 DATA_FILE = "sent_contests.json"
 BD_TZ = pytz.timezone("Asia/Dhaka")
@@ -15,6 +16,7 @@ BD_TZ = pytz.timezone("Asia/Dhaka")
 intents = discord.Intents.default()
 client = discord.Client(intents=intents)
 
+# load sent contest memory
 if os.path.exists(DATA_FILE):
     with open(DATA_FILE, "r") as f:
         sent_contests = json.load(f)
@@ -27,7 +29,9 @@ def save_data():
 
 async def check_contests():
     await client.wait_until_ready()
-    channel = client.get_channel(CHANNEL_ID)
+
+    announce_channel = client.get_channel(CHANNEL_ID)
+    reminder_channel = client.get_channel(REMINDER_CHANNEL_ID)
 
     while not client.is_closed():
         try:
@@ -40,15 +44,18 @@ async def check_contests():
 
             for contest in contests:
 
+                # only upcoming contests
                 if contest["phase"] != "BEFORE":
                     continue
 
                 name = contest["name"].lower()
 
-                if "rated" not in name:
+                # skip unrated contests
+                if "unrated" in name:
                     continue
 
-                if "div. 1" in name or "div1" in name:
+                # skip div1 only contests
+                if "div. 1" in name and "div. 2" not in name:
                     continue
 
                 contest_id = str(contest["id"])
@@ -61,19 +68,17 @@ async def check_contests():
 
                 diff = (start_time_utc - now_utc).total_seconds()
 
-                if 86000 < diff < 87000:
-
-                    if contest_id in sent_contests:
-                        continue
+                # announce contest if not already sent
+                if contest_id not in sent_contests:
 
                     embed = discord.Embed(
-                        title="🇧🇩 Codeforces Rated Contest Reminder",
+                        title="📢 Upcoming Codeforces Contest",
                         description=f"**{contest['name']}**",
                         color=discord.Color.blue()
                     )
 
                     embed.add_field(
-                        name="🗓 Start Time (Bangladesh)",
+                        name="🕒 Start Time (Bangladesh)",
                         value=start_time_bd.strftime("%Y-%m-%d %I:%M %p"),
                         inline=False
                     )
@@ -90,13 +95,48 @@ async def check_contests():
                         inline=False
                     )
 
-                    embed.set_footer(text="Starts in 1 day. Prepare well 🔥")
+                    embed.set_footer(text="Contest detected from Codeforces upcoming list")
 
-                    await channel.send("@everyone")
-                    await channel.send(embed=embed)
+                    await announce_channel.send("@everyone")
+                    await announce_channel.send(embed=embed)
 
-                    sent_contests[contest_id] = True
+                    sent_contests[contest_id] = {
+                        "announced": True,
+                        "reminder_sent": False
+                    }
+
                     save_data()
+
+                # 8 hour reminder
+                if contest_id in sent_contests:
+
+                    reminder_sent = sent_contests[contest_id]["reminder_sent"]
+
+                    if not reminder_sent and 28000 < diff < 29000:
+
+                        embed = discord.Embed(
+                            title="⏰ Codeforces Contest Reminder (8 Hours)",
+                            description=f"**{contest['name']}**",
+                            color=discord.Color.orange()
+                        )
+
+                        embed.add_field(
+                            name="🕒 Start Time (BD)",
+                            value=start_time_bd.strftime("%Y-%m-%d %I:%M %p"),
+                            inline=False
+                        )
+
+                        embed.add_field(
+                            name="🔗 Contest Link",
+                            value=f"https://codeforces.com/contest/{contest['id']}",
+                            inline=False
+                        )
+
+                        await reminder_channel.send("@everyone")
+                        await reminder_channel.send(embed=embed)
+
+                        sent_contests[contest_id]["reminder_sent"] = True
+                        save_data()
 
             await asyncio.sleep(600)
 
