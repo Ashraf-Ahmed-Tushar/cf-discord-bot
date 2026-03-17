@@ -112,9 +112,8 @@ def reg_status(ts):
 def make_past_header():
     return (
         "```\n"
-        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        "  📜  PAST CODEFORCES CONTESTS\n"
-        "  Tracked since this bot started\n"
+        "     📜  PAST CODEFORCES CONTESTS\n"
+        "     Tracked since this bot started\n"
         "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
         "```"
     )
@@ -123,10 +122,8 @@ def make_past_header():
 def make_upcoming_header():
     return (
         "```\n"
-        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        "  📢  UPCOMING CODEFORCES CONTESTS\n"
-        "  Auto-updates every 10 minutes\n"
-        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        "    📢  UPCOMING CODEFORCES CONTESTS\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
         "```"
     )
 
@@ -151,7 +148,7 @@ def embed_upcoming_list(contests):
             description="*No upcoming rated contests right now. Check back soon!*",
             color=0x5865F2,
         )
-        e.set_footer(text=f"📢 Upcoming  •  Updates every 10 min  •  {OWNER_NAME}")
+        e.set_footer(text=f"📢 Upcoming  •  {OWNER_NAME}")
         return e
 
     total = len(contests)
@@ -178,7 +175,7 @@ def embed_upcoming_list(contests):
         )
 
     e.description = "\n\n".join(blocks)
-    e.set_footer(text=f"📢 {total} contest(s) upcoming  •  Updates every 10 min  •  {OWNER_NAME}")
+    e.set_footer(text=f"📢 {total} contest(s) upcoming  •  {OWNER_NAME}")
     e.timestamp = datetime.now(timezone.utc)
     return e
 
