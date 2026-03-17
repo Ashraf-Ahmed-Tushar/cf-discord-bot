@@ -1,4 +1,5 @@
 import discord
+from discord.ext import commands
 import aiohttp
 import asyncio
 import json
@@ -30,15 +31,19 @@ REMINDER_CHANNEL_ID = int(os.getenv("REMINDER_CHANNEL_ID"))
 BD_TZ = pytz.timezone("Asia/Dhaka")
 
 intents = discord.Intents.default()
-client = discord.Client(intents=intents)
+intents.message_content = True  # প্রয়োজন command এর জন্য
 
+bot = commands.Bot(command_prefix=';', intents=intents)
+
+
+# ================= AUTO CHECK TASK =================
 async def check_contests():
-    await client.wait_until_ready()
+    await bot.wait_until_ready()
 
-    announce_channel = client.get_channel(CHANNEL_ID)
-    reminder_channel = client.get_channel(REMINDER_CHANNEL_ID)
+    announce_channel = bot.get_channel(CHANNEL_ID)
+    reminder_channel = bot.get_channel(REMINDER_CHANNEL_ID)
 
-    while not client.is_closed():
+    while not bot.is_closed():
         try:
             async with aiohttp.ClientSession() as session:
                 async with session.get("https://codeforces.com/api/contest.list") as resp:
@@ -67,7 +72,8 @@ async def check_contests():
                 start_time_bd = start_time_utc.astimezone(BD_TZ)
                 diff = (start_time_utc - now_utc).total_seconds()
 
-                messages = await announce_channel.history(limit=10).flatten()
+                # ===== ANNOUNCE CHECK =====
+                messages = [msg async for msg in announce_channel.history(limit=10)]
                 already_sent = any(
                     f"https://codeforces.com/contest/{contest['id']}" in msg.content for msg in messages
                 )
@@ -79,20 +85,18 @@ async def check_contests():
                         description=f"\n**{contest['name']}**\n",
                         color=discord.Color.blue()
                     )
-                    embed.add_field(
-                        name="🕒 Start Time",
-                        value=time_text,
-                        inline=False
-                    )
+                    embed.add_field(name="🕒 Start Time", value=time_text, inline=False)
                     embed.add_field(
                         name="🔗 Contest Link",
                         value=f"https://codeforces.com/contest/{contest['id']}",
                         inline=False
                     )
-                    await announce_channel.send("\n", embed=embed)
+
+                    await announce_channel.send(embed=embed)
                     await announce_channel.send("\nBest of luck ||@everyone|| 🍀\n")
 
-                messages_rem = await reminder_channel.history(limit=10).flatten()
+                # ===== REMINDER CHECK =====
+                messages_rem = [msg async for msg in reminder_channel.history(limit=10)]
                 already_reminder_sent = any(
                     f"https://codeforces.com/contest/{contest['id']}" in msg.content for msg in messages_rem
                 )
@@ -104,17 +108,14 @@ async def check_contests():
                         description=f"\n**{contest['name']}**\n",
                         color=discord.Color.orange()
                     )
-                    embed.add_field(
-                        name="🕒 Start Time",
-                        value=time_text,
-                        inline=False
-                    )
+                    embed.add_field(name="🕒 Start Time", value=time_text, inline=False)
                     embed.add_field(
                         name="🔗 Contest Link",
                         value=f"https://codeforces.com/contest/{contest['id']}",
                         inline=False
                     )
-                    await reminder_channel.send("\n", embed=embed)
+
+                    await reminder_channel.send(embed=embed)
                     await reminder_channel.send("\nBest of luck ||@everyone|| 🍀\n")
 
             await asyncio.sleep(600)
@@ -123,11 +124,60 @@ async def check_contests():
             print("Error:", e)
             await asyncio.sleep(60)
 
-@client.event
+
+# ================= COMMAND =================
+@bot.command()
+async def upcoming(ctx):
+    async with aiohttp.ClientSession() as session:
+        async with session.get("https://codeforces.com/api/contest.list") as resp:
+            data = await resp.json()
+
+    contests = data["result"]
+    now_utc = datetime.now(timezone.utc)
+
+    upcoming = []
+
+    for contest in contests:
+        if contest["phase"] != "BEFORE":
+            continue
+        name = contest["name"].lower()
+        if "unrated" in name:
+            continue
+        if "div. 1" in name and "div. 2" not in name:
+            continue
+        upcoming.append(contest)
+
+    upcoming.sort(key=lambda x: x["startTimeSeconds"])
+
+    for contest in upcoming[:5]:
+        start_time_utc = datetime.fromtimestamp(
+            contest["startTimeSeconds"], tz=timezone.utc
+        )
+        start_time_bd = start_time_utc.astimezone(BD_TZ)
+
+        time_text = start_time_bd.strftime("%d-%m-%Y  < %I:%M %p >")
+
+        embed = discord.Embed(
+            title="📢 Upcoming Codeforces Contest",
+            description=f"\n**{contest['name']}**\n",
+            color=discord.Color.green()
+        )
+        embed.add_field(name="🕒 Start Time", value=time_text, inline=False)
+        embed.add_field(
+            name="🔗 Contest Link",
+            value=f"https://codeforces.com/contest/{contest['id']}",
+            inline=False
+        )
+
+        await ctx.send(embed=embed)
+
+
+# ================= READY =================
+@bot.event
 async def on_ready():
-    print(f"Logged in as {client.user}")
-    client.loop.create_task(check_contests())
+    print(f"Logged in as {bot.user}")
+    bot.loop.create_task(check_contests())
+
 
 keep_alive()
-
-client.run(TOKEN)
+bot.run(TOKEN)
