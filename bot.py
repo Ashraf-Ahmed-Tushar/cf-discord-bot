@@ -1,3 +1,24 @@
+"""
+Codeforces Contest Tracker — Discord Bot
+=========================================
+
+Channel layout (all 4 messages posted once by the bot on first run):
+
+  ┌─────────────────────────────────────────┐
+  │  [STATIC]  📜 Past Codeforces Contests  │  ← never edited
+  ├─────────────────────────────────────────┤
+  │  [LIVE]    Past contest list embed      │  ← edited as contests finish
+  │            (may grow into multiple msgs)│
+  ├─────────────────────────────────────────┤
+  │  [STATIC]  📢 Upcoming Contests         │  ← never edited, acts as divider
+  ├─────────────────────────────────────────┤
+  │  [LIVE]    Upcoming contest list embed  │  ← edited every 10 min
+  └─────────────────────────────────────────┘
+
+Past counting starts at 1 from the moment the bot is first deployed.
+Historical contests that were already finished before bot start are ignored.
+"""
+
 import discord
 from discord.ext import commands
 import aiohttp
@@ -5,111 +26,247 @@ import asyncio
 import os
 from datetime import datetime, timezone
 
-# ===== ENV =====
-TOKEN = os.getenv("TOKEN")
-CHANNEL_ID = int(os.getenv("CHANNEL_ID", "0"))
+# ───────────────────────────── ENV ─────────────────────────────
+TOKEN              = os.getenv("TOKEN")
+CHANNEL_ID         = int(os.getenv("CHANNEL_ID", "0"))
 REMINDER_CHANNEL_ID = int(os.getenv("REMINDER_CHANNEL_ID", "0"))
 
-# ===== BOT SETUP =====
+# ─────────────────────────── BOT SETUP ─────────────────────────
 intents = discord.Intents.default()
 intents.message_content = True
 bot = commands.Bot(command_prefix=";", intents=intents)
 
-# ===== GLOBAL STATE =====
-# IDs of the pinned live messages
-UPCOMING_MSG_ID = None
-PAST_MSG_ID = None
+# ──────────────────────────── STATE ────────────────────────────
+# Message IDs for the 4 managed channel messages
+MSG_PAST_HEADER   = None   # static "📜 Past …" title message
+MSG_PAST_LIST     = None   # editable past contest embed (latest page)
+MSG_UP_HEADER     = None   # static "📢 Upcoming …" divider message
+MSG_UP_LIST       = None   # editable upcoming embed
 
-# Track which contest IDs have triggered a reminder already (in memory)
-REMINDED_IDS: set = set()
+# Contests tracked since this bot run started
+PAST_ENTRIES: list[dict] = []   # {"num": int, "name": str, "div": str, "id": int}
+PAST_IDS: set[int]       = set()
+REMINDED_IDS: set[int]   = set()
+ANNOUNCED_IDS: set[int]  = set()
 
-# Track posted past contest IDs and their count
-PAST_POSTED_IDS: set = set()
-PAST_COUNT = 0
+# Timestamp of when bot connected — only contests finishing AFTER this count
+BOT_START_UTC: datetime  = None
+
+# How many past entries fit in one embed before we start a new message
+PAST_PAGE_SIZE = 25
 
 
-# ===== FETCH =====
-async def fetch_cf():
+# ══════════════════════════════════════════════════════════════
+#  HELPERS
+# ══════════════════════════════════════════════════════════════
+
+async def fetch_cf() -> list:
     url = "https://codeforces.com/api/contest.list"
     async with aiohttp.ClientSession() as session:
-        async with session.get(url, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+        async with session.get(url, timeout=aiohttp.ClientTimeout(total=20)) as resp:
             data = await resp.json()
     return data["result"]
 
 
+def get_division(name: str) -> str:
+    n = name.lower()
+    if "div. 1 + div. 2" in n or "div. 1 + 2" in n:
+        return "1+2"
+    if "div. 1" in n:
+        return "1"
+    if "div. 2" in n:
+        return "2"
+    if "div. 3" in n:
+        return "3"
+    if "div. 4" in n:
+        return "4"
+    if "educational" in n:
+        return "edu"
+    if "global" in n:
+        return "global"
+    return "other"
+
+
+def div_color(div: str) -> int:
+    """Embed left-bar colour based on division difficulty."""
+    return {
+        "1+2":    0xE91E63,   # pink-red   — hardest combined
+        "1":      0xE74C3C,   # red        — hardest
+        "2":      0xE67E22,   # orange     — medium
+        "3":      0x3498DB,   # blue       — easier
+        "4":      0x57F287,   # green      — easiest
+        "edu":    0x1ABC9C,   # teal       — educational
+        "global": 0x9B59B6,   # purple     — global rounds
+        "other":  0x99AAB5,   # grey
+    }.get(div, 0x99AAB5)
+
+
+def div_label(div: str) -> str:
+    return {
+        "1+2":    "Div. 1 + Div. 2",
+        "1":      "Div. 1",
+        "2":      "Div. 2",
+        "3":      "Div. 3",
+        "4":      "Div. 4",
+        "edu":    "Educational",
+        "global": "Global Round",
+        "other":  "Special / Other",
+    }.get(div, div)
+
+
+def div_medal(div: str) -> str:
+    return {
+        "1+2":    "🔴",
+        "1":      "🔴",
+        "2":      "🟠",
+        "3":      "🔵",
+        "4":      "🟢",
+        "edu":    "🟦",
+        "global": "🟣",
+        "other":  "⚪",
+    }.get(div, "⚪")
+
+
 def should_include(contest: dict) -> bool:
-    """Filter: keep only rated contests that are Div.2, Div.3, Div.4, or combined Div.1+2."""
+    """Keep only rated contests we care about."""
     name = contest["name"].lower()
     if "unrated" in name:
         return False
-    # Skip pure Div.1 (not combined)
-    if "div. 1" in name and "div. 2" not in name:
+    # Drop pure Div.1 (too hard for most community members)
+    if "div. 1" in name and "div. 2" not in name and "global" not in name:
         return False
     return True
 
 
-# ===== EMBEDS =====
-def build_upcoming_embed(contests: list) -> discord.Embed:
-    """
-    Build a single rich embed listing upcoming contests.
-    Numbered in reverse: closest = 1 (shown last), furthest = N (shown first).
-    """
-    embed = discord.Embed(
-        title="📢  Upcoming Codeforces Contests",
-        color=0x5865F2,  # Discord blurple
-    )
-    embed.set_footer(text="Updates every 10 min  •  cf.bot")
+# ══════════════════════════════════════════════════════════════
+#  EMBED BUILDERS
+# ══════════════════════════════════════════════════════════════
 
+def build_past_header_msg() -> str:
+    return (
+        "```\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        "  📜  PAST CODEFORCES CONTESTS\n"
+        "  Contests tracked since this bot started\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        "```"
+    )
+
+
+def build_upcoming_header_msg() -> str:
+    return (
+        "```\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        "  📢  UPCOMING CODEFORCES CONTESTS\n"
+        "  Auto-updates every 10 minutes\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        "```"
+    )
+
+
+def build_past_list_embed(entries: list[dict]) -> discord.Embed:
+    """
+    entries: list of {"num": int, "name": str, "div": str}
+    Each entry is one finished contest tracked since bot start.
+    """
+    embed = discord.Embed(color=0x2B2D31)  # dark neutral
+
+    if not entries:
+        embed.description = "*No contests have ended since the bot started.*"
+        embed.set_footer(text="📜 Past Contests  •  cf.bot")
+        return embed
+
+    lines = []
+    for e in entries:
+        medal = div_medal(e["div"])
+        lines.append(f"`{e['num']:>3}.` {medal}  **{e['name']}**")
+
+    embed.description = "\n".join(lines)
+    last = entries[-1]
+    embed.set_footer(
+        text=f"📜 {len(entries)} contest(s) completed  •  cf.bot"
+    )
+    return embed
+
+
+def build_upcoming_list_embed(contests: list) -> discord.Embed:
+    """
+    One embed with all upcoming contests.
+    Numbered in reverse: furthest = N (top), closest = 1 (bottom).
+    Each contest is a rich field block.
+    """
     if not contests:
-        embed.description = "*No upcoming rated contests right now.*"
+        embed = discord.Embed(
+            description="*No upcoming rated contests right now. Check back soon!*",
+            color=0x5865F2,
+        )
+        embed.set_footer(text="📢 Upcoming  •  Updates every 10 min  •  cf.bot")
         return embed
 
     total = len(contests)
-    lines = []
+    # Use the division colour of the soonest contest for the embed stripe
+    soonest_div = get_division(contests[0]["name"])
+    embed = discord.Embed(color=div_color(soonest_div))
+
     for i, c in enumerate(contests):
-        num = total - i  # reverse numbering
-        ts = c["startTimeSeconds"]
-        lines.append(
-            f"**`#{num}`**  **{c['name']}**\n"
-            f"⠀⠀🕒 <t:{ts}:F>  ·  ⏳ <t:{ts}:R>\n"
-            f"⠀⠀🔗 [codeforces.com/contest/{c['id']}](https://codeforces.com/contest/{c['id']})"
+        num   = total - i          # reverse numbering
+        div   = get_division(c["name"])
+        ts    = c["startTimeSeconds"]
+        medal = div_medal(div)
+        label = div_label(div)
+        cid   = c["id"]
+
+        # Field name = contest title with number + division badge
+        field_name = f"{medal}  `#{num}`  {c['name']}"
+
+        # Field value = structured info
+        field_val = (
+            f"🏷️  **Division:** {label}\n"
+            f"📅  **Start:** <t:{ts}:F>\n"
+            f"⏳  **Countdown:** <t:{ts}:R>\n"
+            f"🔗  [Open on Codeforces](https://codeforces.com/contest/{cid})"
         )
 
-    embed.description = "\n\n".join(lines)
+        embed.add_field(name=field_name, value=field_val, inline=False)
+
+    embed.set_footer(
+        text=f"📢 {total} contest(s) upcoming  •  Updates every 10 min  •  cf.bot"
+    )
     embed.timestamp = datetime.now(timezone.utc)
     return embed
 
 
-def build_past_embed(contests_lines: list, start_num: int) -> discord.Embed:
-    """
-    Build an embed for a page of past contests.
-    contests_lines: list of contest name strings (oldest first in this chunk).
-    start_num: the number of the first contest in this chunk.
-    """
-    embed = discord.Embed(
-        title="📜  Past Codeforces Contests",
-        color=0x57F287,  # green
-    )
-    lines = []
-    for i, name in enumerate(contests_lines):
-        lines.append(f"**`{start_num + i}.`**  {name}")
-    embed.description = "\n".join(lines)
-    embed.set_footer(text="Completed contests  •  cf.bot")
-    return embed
-
-
 def build_announce_embed(contest: dict) -> discord.Embed:
-    ts = contest["startTimeSeconds"]
+    div = get_division(contest["name"])
+    ts  = contest["startTimeSeconds"]
+    cid = contest["id"]
     embed = discord.Embed(
-        title="📢  New Contest Announced",
-        description=f"## {contest['name']}",
-        color=0x5865F2,
+        title="📢  New Contest Announced!",
+        color=div_color(div),
     )
-    embed.add_field(name="🕒  Start Time", value=f"<t:{ts}:F>", inline=False)
-    embed.add_field(name="⏳  Countdown", value=f"<t:{ts}:R>", inline=False)
+    embed.add_field(
+        name="🏆  Contest",
+        value=f"**{contest['name']}**",
+        inline=False,
+    )
+    embed.add_field(
+        name="🏷️  Division",
+        value=div_label(div),
+        inline=True,
+    )
+    embed.add_field(
+        name="📅  Start Time",
+        value=f"<t:{ts}:F>",
+        inline=True,
+    )
+    embed.add_field(
+        name="⏳  Countdown",
+        value=f"<t:{ts}:R>",
+        inline=False,
+    )
     embed.add_field(
         name="🔗  Link",
-        value=f"[codeforces.com/contest/{contest['id']}](https://codeforces.com/contest/{contest['id']})",
+        value=f"[codeforces.com/contest/{cid}](https://codeforces.com/contest/{cid})",
         inline=False,
     )
     embed.set_footer(text="Codeforces  •  cf.bot")
@@ -117,340 +274,445 @@ def build_announce_embed(contest: dict) -> discord.Embed:
 
 
 def build_reminder_embed(contest: dict, hours: int) -> discord.Embed:
-    ts = contest["startTimeSeconds"]
+    div = get_division(contest["name"])
+    ts  = contest["startTimeSeconds"]
+    cid = contest["id"]
     embed = discord.Embed(
-        title=f"⏰  Contest Reminder — {hours}h to go!",
-        description=f"## {contest['name']}",
-        color=0xFEE75C,  # yellow
+        title=f"⏰  Reminder — {hours} hours left!",
+        color=0xFEE75C,
     )
-    embed.add_field(name="🕒  Start Time", value=f"<t:{ts}:F>", inline=False)
-    embed.add_field(name="⏳  Time Left", value=f"<t:{ts}:R>", inline=False)
     embed.add_field(
-        name="🔗  Join Now",
-        value=f"[codeforces.com/contest/{contest['id']}](https://codeforces.com/contest/{contest['id']})",
+        name="🏆  Contest",
+        value=f"**{contest['name']}**",
+        inline=False,
+    )
+    embed.add_field(
+        name="🏷️  Division",
+        value=div_label(div),
+        inline=True,
+    )
+    embed.add_field(
+        name="📅  Start Time",
+        value=f"<t:{ts}:F>",
+        inline=True,
+    )
+    embed.add_field(
+        name="⏳  Time Left",
+        value=f"<t:{ts}:R>",
+        inline=False,
+    )
+    embed.add_field(
+        name="🔗  Join",
+        value=f"[codeforces.com/contest/{cid}](https://codeforces.com/contest/{cid})",
         inline=False,
     )
     embed.set_footer(text="Codeforces  •  cf.bot")
     return embed
 
 
-# ===== BACKGROUND TASKS =====
+# ══════════════════════════════════════════════════════════════
+#  CHANNEL SETUP  (run once on startup)
+# ══════════════════════════════════════════════════════════════
 
-async def task_update_upcoming():
+PAST_HEADER_MARKER   = "PAST CODEFORCES CONTESTS"
+UPCOMING_HEADER_MARKER = "UPCOMING CODEFORCES CONTESTS"
+PAST_LIST_FOOTER     = "📜"      # footer starts with this
+UPCOMING_LIST_FOOTER = "📢"      # footer starts with this
+
+
+async def setup_channel(channel: discord.TextChannel):
     """
-    Every 10 min: fetch upcoming contests, rebuild the embed, edit-in-place (or post new).
+    Scan channel history to find existing bot messages.
+    If not found, post them in order:
+      past_header → past_list → upcoming_header → upcoming_list
     """
-    global UPCOMING_MSG_ID
+    global MSG_PAST_HEADER, MSG_PAST_LIST, MSG_UP_HEADER, MSG_UP_LIST
+
+    print("[setup] Scanning channel history…")
+
+    # Collect bot messages (newest first from Discord)
+    bot_msgs: list[discord.Message] = []
+    async for msg in channel.history(limit=200):
+        if msg.author == bot.user:
+            bot_msgs.append(msg)
+
+    # Reverse so we iterate oldest → newest
+    bot_msgs.reverse()
+
+    for msg in bot_msgs:
+        content = msg.content or ""
+        # Static headers (plain text codeblock)
+        if PAST_HEADER_MARKER in content:
+            MSG_PAST_HEADER = msg.id
+            print(f"[setup] Found past header: {msg.id}")
+        elif UPCOMING_HEADER_MARKER in content:
+            MSG_UP_HEADER = msg.id
+            print(f"[setup] Found upcoming header: {msg.id}")
+        # Live embeds identified by footer prefix
+        elif msg.embeds:
+            em = msg.embeds[0]
+            footer_text = em.footer.text if em.footer else ""
+            if footer_text.startswith(PAST_LIST_FOOTER):
+                MSG_PAST_LIST = msg.id
+                print(f"[setup] Found past list: {msg.id}")
+            elif footer_text.startswith(UPCOMING_LIST_FOOTER):
+                MSG_UP_LIST = msg.id
+                print(f"[setup] Found upcoming list: {msg.id}")
+
+    # Post any missing messages in the right order
+    if not MSG_PAST_HEADER:
+        m = await channel.send(build_past_header_msg())
+        MSG_PAST_HEADER = m.id
+        print(f"[setup] Posted past header: {m.id}")
+        await asyncio.sleep(0.5)
+
+    if not MSG_PAST_LIST:
+        embed = build_past_list_embed([])
+        m = await channel.send(embed=embed)
+        MSG_PAST_LIST = m.id
+        print(f"[setup] Posted past list: {m.id}")
+        await asyncio.sleep(0.5)
+
+    if not MSG_UP_HEADER:
+        m = await channel.send(build_upcoming_header_msg())
+        MSG_UP_HEADER = m.id
+        print(f"[setup] Posted upcoming header: {m.id}")
+        await asyncio.sleep(0.5)
+
+    if not MSG_UP_LIST:
+        embed = build_upcoming_list_embed([])
+        m = await channel.send(embed=embed)
+        MSG_UP_LIST = m.id
+        print(f"[setup] Posted upcoming list: {m.id}")
+
+    print("[setup] Channel ready ✅")
+
+
+# ══════════════════════════════════════════════════════════════
+#  BACKGROUND TASKS
+# ══════════════════════════════════════════════════════════════
+
+async def _edit_or_repost(channel: discord.TextChannel, msg_id_attr: str, embed: discord.Embed):
+    """Helper: edit an existing message or repost if deleted."""
+    global MSG_PAST_LIST, MSG_UP_LIST
+
+    msg_id = globals()[msg_id_attr]
+    if msg_id:
+        try:
+            msg = await channel.fetch_message(msg_id)
+            await msg.edit(embed=embed)
+            return
+        except (discord.NotFound, discord.HTTPException):
+            pass
+    # Re-post
+    msg = await channel.send(embed=embed)
+    globals()[msg_id_attr] = msg.id
+
+
+async def task_upcoming():
+    """Every 10 min: refresh the upcoming embed in place."""
+    await bot.wait_until_ready()
+    channel = bot.get_channel(CHANNEL_ID)
+    await setup_channel(channel)
+
+    while not bot.is_closed():
+        try:
+            all_c = await fetch_cf()
+            upcoming = sorted(
+                [c for c in all_c if c["phase"] == "BEFORE" and should_include(c)],
+                key=lambda x: x["startTimeSeconds"],
+            )
+            embed = build_upcoming_list_embed(upcoming)
+            await _edit_or_repost(channel, "MSG_UP_LIST", embed)
+        except Exception as e:
+            print(f"[upcoming] {e}")
+        await asyncio.sleep(600)
+
+
+async def task_past():
+    """
+    Every 5 min: detect contests that finished AFTER bot start.
+    Append them to PAST_ENTRIES and edit the past list embed.
+    """
+    global PAST_ENTRIES, PAST_IDS, MSG_PAST_LIST
 
     await bot.wait_until_ready()
     channel = bot.get_channel(CHANNEL_ID)
 
+    # Wait for setup_channel to finish (task_upcoming runs setup)
+    await asyncio.sleep(8)
+
     while not bot.is_closed():
         try:
-            all_contests = await fetch_cf()
-            upcoming = [c for c in all_contests if c["phase"] == "BEFORE" and should_include(c)]
-            upcoming.sort(key=lambda x: x["startTimeSeconds"])
+            all_c = await fetch_cf()
 
-            embed = build_upcoming_embed(upcoming)
+            # Finished contests that ended AFTER bot start and pass filter
+            newly_done = []
+            for c in all_c:
+                if c["phase"] != "FINISHED":
+                    continue
+                if not should_include(c):
+                    continue
+                if c["id"] in PAST_IDS:
+                    continue
+                # "startTimeSeconds" is when it started; durationSeconds is length
+                # We approximate finish time as start + duration
+                finish_ts = c["startTimeSeconds"] + c.get("durationSeconds", 0)
+                finish_dt = datetime.fromtimestamp(finish_ts, tz=timezone.utc)
+                if finish_dt <= BOT_START_UTC:
+                    continue
+                newly_done.append((finish_ts, c))
 
-            if UPCOMING_MSG_ID:
-                try:
-                    msg = await channel.fetch_message(UPCOMING_MSG_ID)
-                    await msg.edit(embed=embed)
-                except (discord.NotFound, discord.HTTPException):
+            # Sort by finish time so numbering is chronological
+            newly_done.sort(key=lambda x: x[0])
+
+            changed = False
+            for _, c in newly_done:
+                PAST_IDS.add(c["id"])
+                num = len(PAST_ENTRIES) + 1
+                div = get_division(c["name"])
+                PAST_ENTRIES.append({"num": num, "name": c["name"], "div": div, "id": c["id"]})
+                changed = True
+                print(f"[past] New entry #{num}: {c['name']}")
+
+            if changed:
+                # If current page is full, send a new message
+                page_entries = PAST_ENTRIES[-PAST_PAGE_SIZE:]  # show latest page
+                embed = build_past_list_embed(PAST_ENTRIES)
+
+                # Discord embed description limit is 4096 — if exceeded, send new msg
+                test_embed = build_past_list_embed(PAST_ENTRIES)
+                if len(test_embed.description or "") > 3900:
+                    # Trim: show only last PAST_PAGE_SIZE entries in this message,
+                    # post a new message for the overflow
+                    overflow = PAST_ENTRIES[-PAST_PAGE_SIZE:]
+                    embed = build_past_list_embed(overflow)
                     msg = await channel.send(embed=embed)
-                    UPCOMING_MSG_ID = msg.id
-            else:
-                msg = await channel.send(embed=embed)
-                UPCOMING_MSG_ID = msg.id
+                    MSG_PAST_LIST = msg.id
+                else:
+                    await _edit_or_repost(channel, "MSG_PAST_LIST", embed)
 
         except Exception as e:
-            print(f"[upcoming] Error: {e}")
+            print(f"[past] {e}")
 
-        await asyncio.sleep(600)
+        await asyncio.sleep(300)
 
 
-async def task_announce_and_remind():
+async def task_announce_remind():
     """
-    Every 10 min: announce new upcoming contests + send 8h reminders.
+    Every 10 min:
+      • Announce newly found upcoming contests (embed + @everyone ping)
+      • Send 8-hour reminder when contest is ~8h away
     """
-    global REMINDED_IDS
+    global ANNOUNCED_IDS, REMINDED_IDS
 
     await bot.wait_until_ready()
     announce_ch = bot.get_channel(CHANNEL_ID)
-    remind_ch = bot.get_channel(REMINDER_CHANNEL_ID)
+    remind_ch   = bot.get_channel(REMINDER_CHANNEL_ID)
 
-    announced_ids: set = set()
-
-    # Pre-seed from channel history so we don't re-announce on restart
+    # Pre-seed announced IDs from recent channel history so we don't re-ping on restart
     try:
-        async for msg in announce_ch.history(limit=50):
+        async for msg in announce_ch.history(limit=100):
             if msg.author == bot.user and msg.embeds:
                 for em in msg.embeds:
                     if em.title and "New Contest Announced" in em.title:
-                        # Try to extract contest id from the link field
                         for field in em.fields:
-                            if "🔗" in field.name and "contest/" in field.value:
-                                cid = field.value.split("contest/")[1].split(")")[0].strip()
+                            if "codeforces.com/contest/" in (field.value or ""):
                                 try:
-                                    announced_ids.add(int(cid))
-                                except ValueError:
+                                    cid = int(field.value.split("contest/")[1].split(")")[0])
+                                    ANNOUNCED_IDS.add(cid)
+                                except (ValueError, IndexError):
                                     pass
     except Exception:
         pass
 
     while not bot.is_closed():
         try:
-            all_contests = await fetch_cf()
+            all_c   = await fetch_cf()
             now_utc = datetime.now(timezone.utc)
 
-            upcoming = [c for c in all_contests if c["phase"] == "BEFORE" and should_include(c)]
-            upcoming.sort(key=lambda x: x["startTimeSeconds"])
+            upcoming = sorted(
+                [c for c in all_c if c["phase"] == "BEFORE" and should_include(c)],
+                key=lambda x: x["startTimeSeconds"],
+            )
 
             for c in upcoming:
-                cid = c["id"]
-                ts = c["startTimeSeconds"]
-                start_dt = datetime.fromtimestamp(ts, tz=timezone.utc)
-                diff_seconds = (start_dt - now_utc).total_seconds()
+                cid  = c["id"]
+                ts   = c["startTimeSeconds"]
+                diff = datetime.fromtimestamp(ts, tz=timezone.utc) - now_utc
+                diff_secs = diff.total_seconds()
 
-                # --- Announce new contest ---
-                if cid not in announced_ids:
-                    announced_ids.add(cid)
+                # ── Announce ──
+                if cid not in ANNOUNCED_IDS:
+                    ANNOUNCED_IDS.add(cid)
                     embed = build_announce_embed(c)
                     await announce_ch.send(embed=embed)
                     await announce_ch.send("Best of luck! ||@everyone|| 🍀")
 
-                # --- 8-hour reminder (window: 28000s – 29000s) ---
-                if cid not in REMINDED_IDS and 28000 < diff_seconds < 29000:
+                # ── 8-hour reminder (28 000 – 29 000 s window) ──
+                if cid not in REMINDED_IDS and 28_000 < diff_secs < 29_000:
                     REMINDED_IDS.add(cid)
                     embed = build_reminder_embed(c, hours=8)
                     await remind_ch.send(embed=embed)
                     await remind_ch.send("Best of luck! ||@everyone|| 🍀")
 
         except Exception as e:
-            print(f"[announce/remind] Error: {e}")
+            print(f"[announce/remind] {e}")
 
         await asyncio.sleep(600)
 
 
-async def task_track_past():
-    """
-    Every 5 min: detect newly finished contests and append them to the past embed.
-    Keeps one live message per ~40 contests (Discord 4096 char limit safety).
-    """
-    global PAST_MSG_ID, PAST_COUNT, PAST_POSTED_IDS
-
-    await bot.wait_until_ready()
-    channel = bot.get_channel(CHANNEL_ID)
-
-    PAGE_SIZE = 40  # contests per embed
-
-    while not bot.is_closed():
-        try:
-            all_contests = await fetch_cf()
-            finished = [c for c in all_contests if c["phase"] == "FINISHED" and should_include(c)]
-            # Sort oldest first so numbering is chronological
-            finished.sort(key=lambda x: x["startTimeSeconds"])
-
-            new_ones = [c for c in finished if c["id"] not in PAST_POSTED_IDS]
-
-            for c in new_ones:
-                PAST_POSTED_IDS.add(c["id"])
-                PAST_COUNT += 1
-
-                # Determine which page this belongs to
-                page_start = ((PAST_COUNT - 1) // PAGE_SIZE) * PAGE_SIZE + 1
-                page_end_idx = PAST_COUNT  # how many entries on this page so far
-
-                # Collect names for current page
-                page_contests = [
-                    fc["name"]
-                    for fc in finished
-                    if fc["id"] in PAST_POSTED_IDS
-                ][page_start - 1: page_end_idx]
-
-                embed = build_past_embed(page_contests, start_num=page_start)
-
-                is_first_in_page = (PAST_COUNT == page_start)
-
-                if is_first_in_page:
-                    # New page → new message
-                    msg = await channel.send(embed=embed)
-                    PAST_MSG_ID = msg.id
-                else:
-                    # Edit existing page message
-                    if PAST_MSG_ID:
-                        try:
-                            msg = await channel.fetch_message(PAST_MSG_ID)
-                            await msg.edit(embed=embed)
-                        except (discord.NotFound, discord.HTTPException):
-                            msg = await channel.send(embed=embed)
-                            PAST_MSG_ID = msg.id
-
-        except Exception as e:
-            print(f"[past] Error: {e}")
-
-        await asyncio.sleep(300)
-
-
-# ===== COMMANDS =====
+# ══════════════════════════════════════════════════════════════
+#  COMMANDS
+# ══════════════════════════════════════════════════════════════
 
 @bot.command(name="upcoming")
 async def cmd_upcoming(ctx):
     """Show current upcoming contests."""
     try:
-        all_contests = await fetch_cf()
-        upcoming = [c for c in all_contests if c["phase"] == "BEFORE" and should_include(c)]
-        upcoming.sort(key=lambda x: x["startTimeSeconds"])
-        embed = build_upcoming_embed(upcoming)
-        await ctx.reply(embed=embed, mention_author=False)
+        all_c = await fetch_cf()
+        upcoming = sorted(
+            [c for c in all_c if c["phase"] == "BEFORE" and should_include(c)],
+            key=lambda x: x["startTimeSeconds"],
+        )
+        await ctx.reply(embed=build_upcoming_list_embed(upcoming), mention_author=False)
     except Exception as e:
-        await ctx.reply(f"❌ Error fetching contests: `{e}`", mention_author=False)
+        await ctx.reply(f"❌ Error: `{e}`", mention_author=False)
 
 
 @bot.command(name="past")
 async def cmd_past(ctx, page: int = 1):
-    """Show past contests (paged). Usage: ;past [page]"""
-    try:
-        all_contests = await fetch_cf()
-        finished = [c for c in all_contests if c["phase"] == "FINISHED" and should_include(c)]
-        finished.sort(key=lambda x: x["startTimeSeconds"])
+    """Show past contests tracked by the bot. Usage: ;past [page]"""
+    page_size = 15
+    start = (page - 1) * page_size
+    end   = start + page_size
+    chunk = PAST_ENTRIES[start:end]
 
-        PAGE_SIZE = 15
-        start_idx = (page - 1) * PAGE_SIZE
-        end_idx = start_idx + PAGE_SIZE
-        page_data = finished[start_idx:end_idx]
+    if not chunk:
+        await ctx.reply(
+            f"❌ No entries on page **{page}**. Total tracked: **{len(PAST_ENTRIES)}**.",
+            mention_author=False,
+        )
+        return
 
-        if not page_data:
-            await ctx.reply(f"❌ No contests on page {page}.", mention_author=False)
-            return
-
-        embed = build_past_embed([c["name"] for c in page_data], start_num=start_idx + 1)
-        total_pages = (len(finished) + PAGE_SIZE - 1) // PAGE_SIZE
-        embed.set_footer(text=f"Page {page}/{total_pages}  •  cf.bot")
-        await ctx.reply(embed=embed, mention_author=False)
-    except Exception as e:
-        await ctx.reply(f"❌ Error: `{e}`", mention_author=False)
+    embed = build_past_list_embed(chunk)
+    total_pages = max(1, (len(PAST_ENTRIES) + page_size - 1) // page_size)
+    embed.set_footer(text=f"📜 Page {page}/{total_pages}  •  cf.bot")
+    await ctx.reply(embed=embed, mention_author=False)
 
 
 @bot.command(name="refresh")
 @commands.has_permissions(manage_messages=True)
 async def cmd_refresh(ctx):
-    """Force-refresh the upcoming embed right now."""
-    global UPCOMING_MSG_ID
+    """Force-refresh the upcoming list embed right now."""
     try:
-        all_contests = await fetch_cf()
-        upcoming = [c for c in all_contests if c["phase"] == "BEFORE" and should_include(c)]
-        upcoming.sort(key=lambda x: x["startTimeSeconds"])
-        embed = build_upcoming_embed(upcoming)
-
+        all_c = await fetch_cf()
+        upcoming = sorted(
+            [c for c in all_c if c["phase"] == "BEFORE" and should_include(c)],
+            key=lambda x: x["startTimeSeconds"],
+        )
         channel = bot.get_channel(CHANNEL_ID)
-        if UPCOMING_MSG_ID:
-            try:
-                msg = await channel.fetch_message(UPCOMING_MSG_ID)
-                await msg.edit(embed=embed)
-                await ctx.reply("✅ Upcoming list refreshed!", mention_author=False)
-                return
-            except (discord.NotFound, discord.HTTPException):
-                pass
-        msg = await channel.send(embed=embed)
-        UPCOMING_MSG_ID = msg.id
-        await ctx.reply("✅ New upcoming list posted!", mention_author=False)
+        await _edit_or_repost(channel, "MSG_UP_LIST", build_upcoming_list_embed(upcoming))
+        await ctx.reply("✅ Upcoming list refreshed!", mention_author=False)
     except Exception as e:
         await ctx.reply(f"❌ Error: `{e}`", mention_author=False)
 
 
 @bot.command(name="setcfchannel")
 @commands.has_permissions(administrator=True)
-async def cmd_set_channel(ctx, channel: discord.TextChannel):
-    """(Admin) Point the bot to a different announce channel at runtime."""
-    global CHANNEL_ID, UPCOMING_MSG_ID, PAST_MSG_ID
+async def cmd_setchannel(ctx, channel: discord.TextChannel):
+    """(Admin) Change the announce channel at runtime."""
+    global CHANNEL_ID, MSG_PAST_HEADER, MSG_PAST_LIST, MSG_UP_HEADER, MSG_UP_LIST
     CHANNEL_ID = channel.id
-    UPCOMING_MSG_ID = None
-    PAST_MSG_ID = None
+    MSG_PAST_HEADER = MSG_PAST_LIST = MSG_UP_HEADER = MSG_UP_LIST = None
     await ctx.reply(
-        f"✅ Announce channel set to {channel.mention}. "
-        "Existing message pointers cleared.",
+        f"✅ Announce channel → {channel.mention}\n"
+        "Bot will post fresh messages there on next cycle.",
         mention_author=False,
     )
 
 
 @bot.command(name="setreminderch")
 @commands.has_permissions(administrator=True)
-async def cmd_set_reminder_ch(ctx, channel: discord.TextChannel):
-    """(Admin) Point the bot to a different reminder channel at runtime."""
+async def cmd_setremind(ctx, channel: discord.TextChannel):
+    """(Admin) Change the reminder channel at runtime."""
     global REMINDER_CHANNEL_ID
     REMINDER_CHANNEL_ID = channel.id
-    await ctx.reply(
-        f"✅ Reminder channel set to {channel.mention}.",
-        mention_author=False,
-    )
+    await ctx.reply(f"✅ Reminder channel → {channel.mention}", mention_author=False)
 
 
 @bot.command(name="cfhelp")
 async def cmd_help(ctx):
-    """Show all available bot commands."""
+    """List all commands."""
     embed = discord.Embed(
-        title="📖  CF Bot — Commands",
-        description="Prefix: `;`",
+        title="📖  CF Bot — Help",
+        description="**Prefix:** `;`\nAll contest data is from the [Codeforces API](https://codeforces.com/api/contest.list).",
         color=0x5865F2,
     )
     embed.add_field(
         name="`;upcoming`",
-        value="Show upcoming rated contests right now.",
+        value="Show all upcoming rated contests right now.",
         inline=False,
     )
     embed.add_field(
         name="`;past [page]`",
-        value="List past contests. Default page 1. E.g. `;past 3`",
+        value="List past contests tracked by the bot (15 per page).\nExample: `;past 2`",
         inline=False,
     )
     embed.add_field(
-        name="`;refresh`  *(Manage Messages)*",
-        value="Force-refresh the live upcoming embed in the announce channel.",
+        name="`;refresh`  ⚠️ *Manage Messages*",
+        value="Force-refresh the live upcoming embed immediately.",
         inline=False,
     )
     embed.add_field(
-        name="`;setcfchannel #channel`  *(Admin)*",
-        value="Change the announce channel without restarting the bot.",
+        name="`;setcfchannel #channel`  🔒 *Admin*",
+        value="Switch the announce channel without restarting.",
         inline=False,
     )
     embed.add_field(
-        name="`;setreminderch #channel`  *(Admin)*",
-        value="Change the reminder channel without restarting the bot.",
+        name="`;setreminderch #channel`  🔒 *Admin*",
+        value="Switch the reminder channel without restarting.",
         inline=False,
     )
     embed.set_footer(text="cf.bot  •  Codeforces Contest Tracker")
     await ctx.reply(embed=embed, mention_author=False)
 
 
-# ===== EVENTS =====
+# ══════════════════════════════════════════════════════════════
+#  EVENTS
+# ══════════════════════════════════════════════════════════════
 
 @bot.event
 async def on_ready():
-    print(f"✅ Logged in as {bot.user} ({bot.user.id})")
-    print(f"   Announce channel : {CHANNEL_ID}")
-    print(f"   Reminder channel : {REMINDER_CHANNEL_ID}")
-    bot.loop.create_task(task_update_upcoming())
-    bot.loop.create_task(task_announce_and_remind())
-    bot.loop.create_task(task_track_past())
+    global BOT_START_UTC
+    BOT_START_UTC = datetime.now(timezone.utc)
+    print(f"✅  Logged in as {bot.user} ({bot.user.id})")
+    print(f"    Announce channel  : {CHANNEL_ID}")
+    print(f"    Reminder channel  : {REMINDER_CHANNEL_ID}")
+    print(f"    Bot start UTC     : {BOT_START_UTC.isoformat()}")
+
+    bot.loop.create_task(task_upcoming())        # also runs setup_channel
+    bot.loop.create_task(task_past())
+    bot.loop.create_task(task_announce_remind())
 
 
 @bot.event
 async def on_command_error(ctx, error):
     if isinstance(error, commands.MissingPermissions):
-        await ctx.reply(
-            "❌ You don't have permission to use this command.",
-            mention_author=False,
-        )
+        await ctx.reply("❌ You don't have permission for that command.", mention_author=False)
     elif isinstance(error, commands.BadArgument):
         await ctx.reply(f"❌ Bad argument: `{error}`", mention_author=False)
+    elif isinstance(error, commands.CommandNotFound):
+        pass  # silently ignore unknown commands
     else:
-        print(f"Command error: {error}")
+        print(f"[error] {error}")
 
 
-# ===== RUN =====
+# ══════════════════════════════════════════════════════════════
+#  RUN
+# ══════════════════════════════════════════════════════════════
+
 if not TOKEN:
-    raise RuntimeError("TOKEN env variable is not set!")
+    raise RuntimeError("TOKEN environment variable is not set!")
 
 bot.run(TOKEN)
