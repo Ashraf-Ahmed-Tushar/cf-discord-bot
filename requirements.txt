@@ -2,3 +2,4 @@ discord.py
 aiohttp
 pytz
 flask
+motor
