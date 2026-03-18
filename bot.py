@@ -1,295 +1,315 @@
 import discord
-from discord.ext import commands, tasks
+from discord.ext import commands
 import aiohttp
 import asyncio
+import json
 import os
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
-TOKEN = os.getenv("TOKEN")
-CHANNEL_ID = int(os.getenv("CHANNEL_ID"))
+TOKEN = "YOUR_DISCORD_BOT_TOKEN"
+
+UPCOMING_CHANNEL_ID = 123456789
+PAST_CHANNEL_ID = 123456789
+REMINDER_CHANNEL_ID = 123456789
+
+CF_API = "https://codeforces.com/api/contest.list"
+
+DATA_FILE = "cf_data.json"
 
 intents = discord.Intents.default()
-bot = commands.Bot(command_prefix=";", intents=intents)
+bot = commands.Bot(command_prefix="!", intents=intents)
 
-PAST_HEADER = "📜 PAST CODEFORCES CONTESTS"
-UPCOMING_HEADER = "📢 UPCOMING CODEFORCES CONTESTS"
+# =========================
+# STORAGE
+# =========================
 
-past_msgs = {}      # contest_id -> message
-upcoming_msgs = {}  # contest_id -> message
+def load_data():
+    if not os.path.exists(DATA_FILE):
+        return {"past": [], "upcoming": [], "reminded": []}
 
-reminded_2h = set()
-start_alert = set()
-
-
-# ==============================
-# Fetch Codeforces
-# ==============================
-
-async def fetch_cf():
-
-    url = "https://codeforces.com/api/contest.list"
-
-    async with aiohttp.ClientSession() as s:
-        async with s.get(url) as r:
-            data = await r.json()
-
-    return data["result"]
+    with open(DATA_FILE) as f:
+        return json.load(f)
 
 
-# ==============================
-# Contest Embed
-# ==============================
+def save_data(data):
+    with open(DATA_FILE, "w") as f:
+        json.dump(data, f, indent=4)
 
-def contest_embed(c, number):
 
-    ts = c["startTimeSeconds"]
-    dur = c["durationSeconds"]
+data = load_data()
 
-    hours = dur // 3600
-    mins = (dur % 3600) // 60
+# =========================
+# FETCH CODEFORCES
+# =========================
+
+async def fetch_contests():
+
+    async with aiohttp.ClientSession() as session:
+        async with session.get(CF_API) as resp:
+            js = await resp.json()
+
+    return js["result"]
+
+
+# =========================
+# TIME FORMAT
+# =========================
+
+def bd_time(ts):
+
+    utc = datetime.fromtimestamp(ts, tz=timezone.utc)
+    bd = utc + timedelta(hours=6)
+
+    return bd.strftime("%d %b %Y • %I:%M %p")
+
+
+# =========================
+# EMBED BUILDERS
+# =========================
+
+def upcoming_embed(contest, num):
 
     e = discord.Embed(
-        title=f"#{number}  {c['name']}",
-        color=0x5865F2
+        title=f"#{num} {contest['name']}",
+        color=0x2f3136
     )
 
     e.add_field(
-        name="📅 Start",
-        value=f"<t:{ts}:F>",
+        name="Start",
+        value=bd_time(contest["startTimeSeconds"]),
         inline=False
     )
 
     e.add_field(
-        name="⏳ Countdown",
-        value=f"<t:{ts}:R>",
-        inline=True
-    )
-
-    e.add_field(
-        name="🕐 Duration",
-        value=f"{hours}h {mins}m",
-        inline=True
-    )
-
-    e.add_field(
-        name="🔗 Contest Link",
-        value=f"https://codeforces.com/contest/{c['id']}",
+        name="Link",
+        value=f"https://codeforces.com/contest/{contest['id']}",
         inline=False
     )
 
     return e
 
 
-# ==============================
-# Scan Channel (restart safe)
-# ==============================
+def past_embed(contest, num):
 
-async def scan_channel():
-
-    channel = bot.get_channel(CHANNEL_ID)
-
-    async for m in channel.history(limit=300):
-
-        if not m.embeds:
-            continue
-
-        embed = m.embeds[0]
-
-        if not embed.fields:
-            continue
-
-        link = embed.fields[-1].value
-
-        if "codeforces.com/contest" not in link:
-            continue
-
-        cid = int(link.split("/")[-1])
-
-        if "📅 Start" in embed.fields[0].name:
-            upcoming_msgs[cid] = m
-        else:
-            past_msgs[cid] = m
-
-
-# ==============================
-# Renumber messages
-# ==============================
-
-async def renumber():
-
-    upcoming = sorted(
-        upcoming_msgs.items(),
-        key=lambda x: x[1].created_at
+    e = discord.Embed(
+        title=f"#{num} {contest['name']}",
+        color=0x202225
     )
 
-    total = len(upcoming)
+    e.add_field(
+        name="Finished",
+        value=bd_time(contest["startTimeSeconds"]),
+        inline=False
+    )
 
-    for i, (cid, msg) in enumerate(upcoming):
+    e.add_field(
+        name="Link",
+        value=f"https://codeforces.com/contest/{contest['id']}",
+        inline=False
+    )
 
-        num = total - i
-
-        embed = msg.embeds[0]
-        name = embed.title.split(" ", 1)[1]
-
-        embed.title = f"#{num} {name}"
-
-        await msg.edit(embed=embed)
+    return e
 
 
-# ==============================
-# Update Upcoming
-# ==============================
+def reminder_embed(contest):
+
+    e = discord.Embed(
+        title="⏰ Contest in 2 Hours",
+        description=contest["name"],
+        color=0xffcc00
+    )
+
+    e.add_field(
+        name="Start Time",
+        value=bd_time(contest["startTimeSeconds"]),
+        inline=False
+    )
+
+    e.add_field(
+        name="Link",
+        value=f"https://codeforces.com/contest/{contest['id']}",
+        inline=False
+    )
+
+    return e
+
+
+# =========================
+# UPDATE UPCOMING
+# =========================
 
 async def update_upcoming():
 
-    contests = await fetch_cf()
+    global data
+
+    contests = await fetch_contests()
 
     upcoming = [
         c for c in contests
         if c["phase"] == "BEFORE"
     ]
 
-    upcoming.sort(key=lambda x: x["startTimeSeconds"])
+    upcoming = sorted(
+        upcoming,
+        key=lambda x: x["startTimeSeconds"]
+    )
 
-    channel = bot.get_channel(CHANNEL_ID)
+    channel = bot.get_channel(UPCOMING_CHANNEL_ID)
 
-    for c in upcoming:
+    ids = [c["id"] for c in upcoming]
 
-        cid = c["id"]
+    for cid in ids:
 
-        if cid not in upcoming_msgs:
+        if cid not in data["upcoming"]:
 
-            msg = await channel.send(
-                embed=contest_embed(c, 0)
-            )
+            contest = next(c for c in upcoming if c["id"] == cid)
 
-            upcoming_msgs[cid] = msg
+            num = len(data["upcoming"]) + 1
 
-    await renumber()
+            msg = await channel.send(embed=upcoming_embed(contest, num))
+
+            data["upcoming"].append({
+                "id": cid,
+                "msg": msg.id
+            })
+
+    save_data(data)
 
 
-# ==============================
-# Move finished contests
-# ==============================
+# =========================
+# MOVE FINISHED
+# =========================
 
-async def check_finished():
+async def update_finished():
 
-    contests = await fetch_cf()
+    global data
 
-    finished = {
+    contests = await fetch_contests()
+
+    finished_ids = [
         c["id"] for c in contests
         if c["phase"] == "FINISHED"
-    }
+    ]
 
-    channel = bot.get_channel(CHANNEL_ID)
+    upcoming_channel = bot.get_channel(UPCOMING_CHANNEL_ID)
+    past_channel = bot.get_channel(PAST_CHANNEL_ID)
 
-    for cid in list(upcoming_msgs):
+    for entry in list(data["upcoming"]):
 
-        if cid in finished:
+        if entry["id"] in finished_ids:
 
-            msg = upcoming_msgs[cid]
+            contest = next(c for c in contests if c["id"] == entry["id"])
 
-            embed = msg.embeds[0]
+            num = len(data["past"]) + 1
 
-            await msg.delete()
-
-            del upcoming_msgs[cid]
-
-            num = len(past_msgs) + 1
-
-            embed.title = f"#{num} {embed.title}"
-
-            new_msg = await channel.send(embed=embed)
-
-            past_msgs[cid] = new_msg
-
-    await renumber()
-
-
-# ==============================
-# Reminder System
-# ==============================
-
-async def check_reminders():
-
-    contests = await fetch_cf()
-
-    now = datetime.now(timezone.utc).timestamp()
-
-    channel = bot.get_channel(CHANNEL_ID)
-
-    for c in contests:
-
-        if c["phase"] != "BEFORE":
-            continue
-
-        ts = c["startTimeSeconds"]
-        cid = c["id"]
-
-        diff = ts - now
-
-        # 2 hour reminder
-        if 7000 < diff < 7200 and cid not in reminded_2h:
-
-            reminded_2h.add(cid)
-
-            await channel.send(
-                f"⏰ **2 hours left** for **{c['name']}**"
+            await past_channel.send(
+                embed=past_embed(contest, num)
             )
 
-        # start alert
-        if 0 < diff < 60 and cid not in start_alert:
+            try:
+                msg = await upcoming_channel.fetch_message(entry["msg"])
+                await msg.delete()
+            except:
+                pass
 
-            start_alert.add(cid)
+            data["past"].append(entry["id"])
+            data["upcoming"].remove(entry)
 
-            await channel.send(
-                f"🔥 **{c['name']} is starting now!**"
-            )
-
-
-# ==============================
-# Main Engine
-# ==============================
-
-@tasks.loop(minutes=5)
-async def engine():
-
-    await update_upcoming()
-
-    await check_finished()
-
-    await check_reminders()
+    save_data(data)
 
 
-# ==============================
-# Commands
-# ==============================
+# =========================
+# REMINDERS
+# =========================
 
-@bot.command()
-async def sync(ctx):
+async def reminder_loop():
 
-    await scan_channel()
+    await bot.wait_until_ready()
 
-    await ctx.send("✅ Channel synced.")
+    while not bot.is_closed():
+
+        try:
+
+            contests = await fetch_contests()
+
+            now = datetime.now(timezone.utc)
+
+            for c in contests:
+
+                if c["phase"] != "BEFORE":
+                    continue
+
+                start = datetime.fromtimestamp(
+                    c["startTimeSeconds"],
+                    tz=timezone.utc
+                )
+
+                diff = (start - now).total_seconds()
+
+                # 2h reminder
+                if 7100 < diff < 7300:
+
+                    if c["id"] not in data["reminded"]:
+
+                        ch = bot.get_channel(REMINDER_CHANNEL_ID)
+
+                        await ch.send(embed=reminder_embed(c))
+
+                        data["reminded"].append(c["id"])
+
+                        save_data(data)
+
+                # start alert
+                if -20 < diff < 20:
+
+                    ch = bot.get_channel(REMINDER_CHANNEL_ID)
+
+                    await ch.send(
+                        f"🔥 **{c['name']} is starting now!**\n"
+                        f"https://codeforces.com/contest/{c['id']}"
+                    )
+
+        except Exception as e:
+            print("Reminder error:", e)
+
+        await asyncio.sleep(60)
 
 
-# ==============================
-# Ready Event
-# ==============================
+# =========================
+# MAIN LOOP
+# =========================
+
+async def contest_loop():
+
+    await bot.wait_until_ready()
+
+    while not bot.is_closed():
+
+        try:
+
+            await update_upcoming()
+
+            await update_finished()
+
+        except Exception as e:
+
+            print("Loop error:", e)
+
+        await asyncio.sleep(300)
+
+
+# =========================
+# READY
+# =========================
 
 @bot.event
 async def on_ready():
 
-    print(f"✅ Logged in as {bot.user}")
+    print("Bot online")
 
-    await scan_channel()
+    bot.loop.create_task(contest_loop())
 
-    engine.start()
+    bot.loop.create_task(reminder_loop())
 
-
-# ==============================
-
-if not TOKEN:
-    raise RuntimeError("TOKEN not set")
 
 bot.run(TOKEN)
