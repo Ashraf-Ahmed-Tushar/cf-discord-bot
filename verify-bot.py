@@ -141,6 +141,20 @@ async def assign_rank_role(member: discord.Member, rating: int):
     role_name, colour, _ = rank_for_rating(rating)
     role = await ensure_rank_role(guild, role_name, colour)
     await member.add_roles(role, reason=f"CF rank: {role_name} ({rating})")
+
+    # ✅ Verified role add
+    verified_role = discord.utils.get(guild.roles, name="Verified")
+    
+    if not verified_role:
+        verified_role = await guild.create_role(
+            name="Verified",
+            color=discord.Color.green(),
+            reason="CF Verify Bot — verified role",
+        )
+    
+    if verified_role not in member.roles:
+        await member.add_roles(verified_role, reason="User verified")
+      
     return role_name
 
 
@@ -187,10 +201,10 @@ def embed_verify_dm(handle: str, token: str) -> discord.Embed:
         description=(
             f"To verify **{handle}** follow these steps:\n\n"
             f"**1.** Go to → https://codeforces.com/settings/general\n"
-            f"**2.** Set your **First name** field to exactly:\n"
+            f"**2.** Go to → Social, Set your **First name** field to exactly:\n"
             f"```{token}```"
             f"**3.** Save, then go back to your server and type `;confirm`\n\n"
-            f"You can remove it from your profile after verification ✅"
+            f"You can remove that code from your profile after verification ✅"
         ),
         color=0x5865F2,
     )
@@ -496,7 +510,7 @@ async def cmd_unverify(ctx, member: discord.Member = None):
     await db.delete_user(member.id)
     # Remove rank roles
     rank_names = {r[1] for r in CF_RANKS}
-    to_remove  = [r for r in member.roles if r.name in rank_names]
+    to_remove  = [r for r in member.roles if r.name in rank_names or r.name == "Verified"]
     if to_remove:
         await member.remove_roles(*to_remove, reason="Unverified by admin")
 
