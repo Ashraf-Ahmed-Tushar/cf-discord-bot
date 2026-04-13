@@ -27,6 +27,21 @@ import string
 from datetime import datetime, timezone
 
 import db
+from flask import Flask
+import threading
+
+app = Flask(__name__)
+
+@app.route('/')
+def home():
+    return "CF Verify Bot is alive!"
+
+def run():
+    app.run(host='0.0.0.0', port=10000)
+
+def keep_alive():
+    t = threading.Thread(target=run)
+    t.start()
 
 # ─── ENV ────────────────────────────────────────────────────────────────────
 TOKEN          = os.getenv("TOKEN")
@@ -684,4 +699,5 @@ async def on_command_error(ctx, error):
 if not TOKEN:
     raise RuntimeError("TOKEN env variable is not set!")
 
+keep_alive()
 bot.run(TOKEN)
